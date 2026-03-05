@@ -1,197 +1,207 @@
-/*
-This file is the starting point of your game.
-
-Some important procedures are:
-- game_init_window: Opens the window
-- game_init: Sets up the game state
-- game_update: Run once per frame
-- game_should_close: For stopping your game when close button is pressed
-- game_shutdown: Shuts down game and frees memory
-- game_shutdown_window: Closes window
-
-The procs above are used regardless if you compile using the `build_release`
-script or the `build_hot_reload` script. However, in the hot reload case, the
-contents of this file is compiled as part of `build/hot_reload/game.dll` (or
-.dylib/.so on mac/linux). In the hot reload cases some other procedures are
-also used in order to facilitate the hot reload functionality:
-
-- game_memory: Run just before a hot reload. That way game_hot_reload.exe has a
-	pointer to the game's memory that it can hand to the new game DLL.
-- game_hot_reloaded: Run after a hot reload so that the `g` global
-	variable can be set to whatever pointer it was in the old DLL.
-
-NOTE: When compiled as part of `build_release`, `build_debug` or `build_web`
-then this whole package is just treated as a normal Odin package. No DLL is
-created.
-*/
-
 package game
 
 import "core:fmt"
+import "core:math"
 import "core:math/linalg"
+import ecs "flecs"
+import "sim"
 import rl "vendor:raylib"
 
-PIXEL_WINDOW_HEIGHT :: 180
+TARGET_FPS :: 60
+PIXEL_WINDOW_WIDTH :: 640
+PIXEL_WINDOW_HEIGHT :: 480
 
 Game_Memory :: struct {
-	player_pos: rl.Vector2,
-	player_texture: rl.Texture,
-	some_number: int,
-	run: bool,
+	run:              bool, // Only mandatory field, needed by harness
+	sim_run:          bool,
+	tick_to_real:     f32,
+	time_accumulator: f32,
+	sim_state:        sim.State,
+	camera_pos:       [3]f32,
+	camera_zoom:      f32,
+	world_camera:     rl.Camera3D,
+	world_ui_camera:  rl.Camera2D,
+	ui_camera:        rl.Camera2D,
+	textures:         [dynamic]rl.Texture,
+	// queries for access to sim data
+	pos_q:            ^ecs.Query,
 }
 
 g: ^Game_Memory
 
-game_camera :: proc() -> rl.Camera2D {
-	w := f32(rl.GetScreenWidth())
-	h := f32(rl.GetScreenHeight())
-
-	return {
-		zoom = h/PIXEL_WINDOW_HEIGHT,
-		target = g.player_pos,
-		offset = { w/2, h/2 },
+init :: proc() {
+	g = new(Game_Memory)
+	g^ = Game_Memory {
+		run          = true,
+		textures     = make([dynamic]rl.Texture, 0),
+		tick_to_real = 1.0 / 60,
+		sim_run      = true,
+		sim_state    = sim.make(),
 	}
+
+	sim.init(&g.sim_state)
+	append(&g.textures, rl.LoadTexture("assets/round_cat.png"))
+
+	g.pos_q = ecs.query_init(
+		g.sim_state.world,
+		&{terms = {0 = {id = ecs.id(g.sim_state.world, sim.Position)}}},
+	)
 }
 
-ui_camera :: proc() -> rl.Camera2D {
-	return {
-		zoom = f32(rl.GetScreenHeight())/PIXEL_WINDOW_HEIGHT,
-	}
+fini :: proc() {
+	delete(g.textures)
+	sim.delete(&g.sim_state)
+	free(g)
 }
 
 update :: proc() {
-	input: rl.Vector2
+	s := &g.sim_state
 
-	if rl.IsKeyDown(.UP) || rl.IsKeyDown(.W) {
-		input.y -= 1
+	dT := rl.GetFrameTime()
+	if g.sim_run {
+		g.time_accumulator += dT
+		for g.time_accumulator >= g.tick_to_real {
+			sim.step(s)
+			g.time_accumulator -= g.tick_to_real
+		}
+	} else {
+		// manually run system for flecs REST module to update web UI
+		rest_system := ecs.lookup(s.world, "flecs.rest.DequeueRest")
+		ecs.run(s.world, rest_system, dT, nil)
 	}
-	if rl.IsKeyDown(.DOWN) || rl.IsKeyDown(.S) {
-		input.y += 1
-	}
-	if rl.IsKeyDown(.LEFT) || rl.IsKeyDown(.A) {
-		input.x -= 1
-	}
-	if rl.IsKeyDown(.RIGHT) || rl.IsKeyDown(.D) {
-		input.x += 1
-	}
+	interp := g.time_accumulator / g.tick_to_real
 
-	input = linalg.normalize0(input)
-	g.player_pos += input * rl.GetFrameTime() * 100
-	g.some_number += 1
+	input()
+	draw(interp)
+}
+
+input :: proc() {
+	dt := min(rl.GetFrameTime(), 1. / TARGET_FPS)
 
 	if rl.IsKeyPressed(.ESCAPE) {
 		g.run = false
 	}
-}
 
-draw :: proc() {
-	rl.BeginDrawing()
-	rl.ClearBackground(rl.BLACK)
+	move: rl.Vector2
 
-	rl.BeginMode2D(game_camera())
-	rl.DrawTextureEx(g.player_texture, g.player_pos, 0, 1, rl.WHITE)
-	rl.DrawRectangleV({20, 20}, {10, 10}, rl.RED)
-	rl.DrawRectangleV({-30, -20}, {10, 10}, rl.GREEN)
-	rl.EndMode2D()
-
-	rl.BeginMode2D(ui_camera())
-
-	// NOTE: `fmt.ctprintf` uses the temp allocator. The temp allocator is
-	// cleared at the end of the frame by the main application, meaning inside
-	// `main_hot_reload.odin`, `main_release.odin` or `main_web_entry.odin`.
-	rl.DrawText(fmt.ctprintf("some_number: %v\nplayer_pos: %v", g.some_number, g.player_pos), 5, 5, 8, rl.WHITE)
-
-	rl.EndMode2D()
-
-	rl.EndDrawing()
-}
-
-@(export)
-game_update :: proc() {
-	update()
-	draw()
-
-	// Everything on tracking allocator is valid until end-of-frame.
-	free_all(context.temp_allocator)
-}
-
-@(export)
-game_init_window :: proc() {
-	rl.SetConfigFlags({.WINDOW_RESIZABLE, .VSYNC_HINT})
-	rl.InitWindow(1280, 720, "Odin + Raylib + Hot Reload template!")
-	rl.SetWindowPosition(200, 200)
-	rl.SetTargetFPS(500)
-	rl.SetExitKey(nil)
-}
-
-@(export)
-game_init :: proc() {
-	g = new(Game_Memory)
-
-	g^ = Game_Memory {
-		run = true,
-		some_number = 100,
-
-		// You can put textures, sounds and music in the `assets` folder. Those
-		// files will be part any release or web build.
-		player_texture = rl.LoadTexture("assets/round_cat.png"),
+	if rl.IsKeyDown(.UP) || rl.IsKeyDown(.W) {
+		move.y -= 1
+	}
+	if rl.IsKeyDown(.DOWN) || rl.IsKeyDown(.S) {
+		move.y += 1
+	}
+	if rl.IsKeyDown(.LEFT) || rl.IsKeyDown(.A) {
+		move.x -= 1
+	}
+	if rl.IsKeyDown(.RIGHT) || rl.IsKeyDown(.D) {
+		move.x += 1
 	}
 
-	game_hot_reloaded(g)
+	if rl.IsKeyPressed(.SPACE) {
+		g.sim_run = !g.sim_run
+	}
+
+	wheel := rl.GetMouseWheelMove()
+	if wheel != 0 {
+		g.camera_zoom += wheel * 0.5
+	}
+
+	move = linalg.normalize0(move)
+	g.camera_pos.xy += move * dt * 100 * math.exp(-g.camera_zoom)
+	g.camera_pos.z = -100
 }
 
-@(export)
-game_should_run :: proc() -> bool {
-	when ODIN_OS != .JS {
-		// Never run this proc in browser. It contains a 16 ms sleep on web!
-		if rl.WindowShouldClose() {
-			return false
+draw :: proc(sim_state_interp: f32) {
+	rl.BeginDrawing()
+	defer rl.EndDrawing()
+	rl.ClearBackground(rl.BLACK)
+
+	s := g.sim_state
+
+	world: {
+		g.world_camera = world_camera()
+		rl.BeginMode3D(g.world_camera)
+		defer rl.EndMode3D()
+
+		// Draw entities as 3D billboards
+		it := ecs.query_iter(s.world, g.pos_q)
+		tex := g.textures[0]
+		for ecs.query_next(&it) {
+			pos_p := ecs.field(&it, sim.Position, 0)
+			for i in 0 ..< it.count {
+				pos := pos_p[i]
+				rl.DrawBillboardPro(
+					g.world_camera,
+					tex,
+					{0, 0, f32(tex.width), f32(tex.height)},
+					{pos.x, pos.y, 0},
+					{0, -1, 0},
+					{10, 10},
+					{5, 5},
+					0,
+					rl.WHITE,
+				)
+			}
 		}
 	}
 
-	return g.run
+	world_ui: {
+		g.world_ui_camera = world_ui_camera()
+		rl.BeginMode2D(g.world_ui_camera)
+		defer rl.EndMode2D()
+
+		mouse_world_pos := rl.GetScreenToWorld2D(rl.GetMousePosition(), g.world_ui_camera)
+
+		//
+		rl.DrawTextureV(g.textures[0], mouse_world_pos, rl.WHITE)
+
+		// Draw name labels on entities
+		it := ecs.query_iter(s.world, g.pos_q)
+		for ecs.query_next(&it) {
+			pos_p := ecs.field(&it, sim.Position, 0)
+			for i in 0 ..< it.count {
+				pos := pos_p[i]
+				id := ([^]ecs.Entity)(it.entities)[i]
+				name := ecs.get_name(s.world, id)
+				if name == nil do name = fmt.ctprint(id)
+				rl.DrawTextEx(rl.GetFontDefault(), name, {pos.x, pos.y}, 10, 1, rl.WHITE)
+			}
+		}
+	}
+
+	screen_ui: {
+		ui_cam := ui_camera()
+		rl.BeginMode2D(ui_cam)
+		defer rl.EndMode2D()
+
+		rl.DrawFPS(5, 5)
+	}
 }
 
-@(export)
-game_shutdown :: proc() {
-	free(g)
+world_camera :: proc() -> rl.Camera3D {
+	//w := f32(rl.GetScreenWidth())
+	h := f32(rl.GetScreenHeight())
+
+	return {
+		position = g.camera_pos,
+		target = {g.camera_pos.x, g.camera_pos.y, g.camera_pos.z + 100},
+		up = {0, -1, 0},
+		fovy = math.exp(-g.camera_zoom) * h / (h / PIXEL_WINDOW_HEIGHT),
+		projection = .ORTHOGRAPHIC,
+	}
 }
 
-@(export)
-game_shutdown_window :: proc() {
-	rl.CloseWindow()
+world_ui_camera :: proc() -> rl.Camera2D {
+	w := f32(rl.GetScreenWidth())
+	h := f32(rl.GetScreenHeight())
+
+	return {
+		zoom = math.exp(g.camera_zoom) * h / PIXEL_WINDOW_HEIGHT,
+		target = g.camera_pos.xy,
+		offset = {w / 2, h / 2},
+	}
 }
 
-@(export)
-game_memory :: proc() -> rawptr {
-	return g
-}
-
-@(export)
-game_memory_size :: proc() -> int {
-	return size_of(Game_Memory)
-}
-
-@(export)
-game_hot_reloaded :: proc(mem: rawptr) {
-	g = (^Game_Memory)(mem)
-
-	// Here you can also set your own global variables. A good idea is to make
-	// your global variables into pointers that point to something inside `g`.
-}
-
-@(export)
-game_force_reload :: proc() -> bool {
-	return rl.IsKeyPressed(.F5)
-}
-
-@(export)
-game_force_restart :: proc() -> bool {
-	return rl.IsKeyPressed(.F6)
-}
-
-// In a web build, this is called when browser changes size. Remove the
-// `rl.SetWindowSize` call if you don't want a resizable game.
-game_parent_window_size_changed :: proc(w, h: int) {
-	rl.SetWindowSize(i32(w), i32(h))
+ui_camera :: proc() -> rl.Camera2D {
+	return {zoom = f32(rl.GetScreenHeight()) / PIXEL_WINDOW_HEIGHT}
 }

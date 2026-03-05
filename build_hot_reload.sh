@@ -27,6 +27,7 @@ case $(uname) in
     if [ ! -d "$OUT_DIR/linux" ]; then
         mkdir -p $OUT_DIR/linux
         cp -r $ROOT/vendor/raylib/linux/libraylib*.so* $OUT_DIR/linux
+        cp -r source/flecs/lib/libflecs*.so $OUT_DIR/linux
     fi
     ;;
 esac
